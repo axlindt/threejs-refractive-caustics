@@ -1,0 +1,32 @@
+{
+  "name": "threejs-refractive-caustics",
+  "version": "0.1.0",
+  "description": "Physically-inspired caustic light patterns for Three.js — arbitrary caster meshes, N-pass chromatic dispersion, temporal accumulation, and artistic post-effects.",
+  "main": "index.js",
+  "module": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "src/",
+    "shaders/",
+    "index.js"
+  ],
+  "type": "module",
+  "scripts": {
+    "dev":         "npx vite playground",
+    "build":       "npx vite build --config vite.config.js && npx vite build --config vite.config.gallery.js",
+    "dev:rooms":   "npx vite examples/rooms",
+    "dev:gallery": "npx vite examples/caustics_gallery"
+  },
+  "keywords": ["threejs", "webgl", "caustics", "glsl", "shader", "light", "rendering"],
+  "author": "Alexandra Lindt",
+  "license": "MIT",
+  "peerDependencies": {
+    "three": ">=0.128.0"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0",
+    "three": "^0.128.0"
+  }
+}

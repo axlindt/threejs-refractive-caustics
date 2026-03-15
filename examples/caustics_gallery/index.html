@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Caustics Gallery</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { overflow:hidden; background:#000; user-select:none; }
+  canvas { display:block; cursor:grab; }
+  canvas.dragging { cursor:grabbing; }
+  #overlay {
+    position:fixed; inset:0; z-index:20; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; background:rgba(3,2,8,.97);
+    color:#fff; cursor:pointer; font-family:'Helvetica Neue',Helvetica,sans-serif;
+  }
+  .ey { font-size:11px; letter-spacing:.54em; color:rgba(255,255,255,.28); margin-bottom:28px; text-transform:uppercase; }
+  .hd { font-size:42px; font-weight:200; letter-spacing:.10em; margin-bottom:56px; color:rgba(255,255,255,.90); }
+  .ct { font-size:13px; letter-spacing:.14em; text-transform:uppercase; color:rgba(255,255,255,.38); line-height:2.8; text-align:center; font-weight:300; }
+  .ct .key { display:inline-block; color:rgba(255,255,255,.70); font-weight:500; letter-spacing:.06em; }
+  .ct .arr { color:rgba(255,255,255,.40); font-size:11px; }
+  #bar-wrap { position:fixed; bottom:0; left:0; right:0; height:1px; background:rgba(255,255,255,.04); z-index:10; pointer-events:none; }
+  #bar { height:100%; background:rgba(255,255,255,.22); width:0; }
+  #lbl { position:fixed; top:28px; left:50%; transform:translateX(-50%); font-family:'Helvetica Neue',sans-serif; font-size:22px; letter-spacing:.35em; text-transform:uppercase; color:rgba(255,255,255,.82); pointer-events:none; font-weight:600; }
+  #hint { position:fixed; bottom:22px; left:50%; transform:translateX(-50%); font-family:'Helvetica Neue',sans-serif; font-size:15px; letter-spacing:.16em; text-transform:uppercase; color:rgba(255,255,255,.55); pointer-events:none; font-weight:500; }
+</style>
+</head>
+<body>
+<div id="overlay">
+  <div class="hd">Caustics Gallery</div>
+  <div class="ey">Click to enter</div>
+  <div class="ct">
+    <div><span class="key">W ↑</span> &nbsp;&nbsp;&nbsp; <span class="key">S ↓</span></div>
+    <div><span class="key">Click + Drag</span> &nbsp;—&nbsp; Look around</div>
+    <div><span class="key">Scroll</span> &nbsp;—&nbsp; Zoom &nbsp;&nbsp; <span class="key">Esc</span> &nbsp;—&nbsp; Return here</div>
+  </div>
+</div>
+<div id="bar-wrap"><div id="bar"></div></div>
+<div id="lbl"></div>
+<div id="hint">W ↑ &nbsp;·&nbsp; S ↓ &nbsp;·&nbsp; drag to look &nbsp;·&nbsp; scroll to zoom &nbsp;·&nbsp; Esc to exit</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { CausticProjector, dentedCubeGeometry, lensGeometry } from '../../index.js';
+
+// ─── RENDERER ────────────────────────────────────────────────────────────────
+var renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+// ── Caustic pipeline requires autoClear = false so N additive passes accumulate
+renderer.autoClear = false;
+// ── No tone mapping / encoding — both crush caustic hotspots. The playground
+//    runs without them; match that exactly.
+renderer.toneMapping  = THREE.NoToneMapping;
+renderer.outputEncoding = THREE.LinearEncoding;
+document.body.appendChild(renderer.domElement);
+
+var scene = new THREE.Scene();
+scene.background = new THREE.Color(0x04030c);
+scene.fog = new THREE.Fog(0x04030c, 80, 200);
+var camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 220);
+
+// ─── GALLERY DIMENSIONS ─────────────────────────────────────────────────────
+// Naming: R1/R2/R3 = Room 1/2/3, P1/P2 = Passage 1/2, ST = Staircase
+//         FL/CL = floor/ceiling Y,  Z0/Z1 = z-start/z-end,  X = half-width
+
+var R1_FL = 0,  R1_CL = 16;     // Room 1 floor & ceiling heights
+var R3_FL = -6, R3_CL = 10;     // Room 3 is 6m below Room 1
+var R2_CL = 22;                  // Room 2 ceiling (tallest — skylight)
+var DROP  = 6;                   // total stair descent (R1_FL − R3_FL)
+var EYE   = 5.5;                 // camera eye height above floor
+var PH    = 10;                  // passage / door opening height
+
+var R1X = 27, R2X = 12, R3X = 9, PX = 3;  // half-widths
+
+// Z layout: Room 1 → Passage 1 → Room 2 → Passage 2 → Room 3
+var R1_Z0 = 2,   R1_Z1 = 36;
+var P1_Z0 = 36,  P1_Z1 = 43;
+var R2_Z0 = 43,  R2_Z1 = 103;
+var P2_Z0 = 103, P2_Z1 = 110;
+var R3_Z0 = 110, R3_Z1 = 168;
+
+// Staircase in Room 2
+var ST_N    = 9;                 // number of steps
+var ST_RUN  = 2.0;               // depth of each tread
+var ST_RISE = DROP / ST_N;       // height of each step
+var ST_Z0   = R2_Z0 + 14;       // staircase start z
+var ST_Z1   = ST_Z0 + ST_N * ST_RUN;
+
+// ─── MATERIALS ───────────────────────────────────────────────────────────────
+function stdMat(c, r, mt) {
+  return new THREE.MeshStandardMaterial({
+    color: c,
+    roughness: (r !== undefined) ? r : 0.88,
+    metalness: mt || 0
+  });
+}
+// Each room has wall (w), floor (f), ceiling (c), and optional stair (s) materials
+var room1Mat   = { w: stdMat(0x18182e,.97), f: stdMat(0x0e0e1e,.99), c: stdMat(0x1a1a30,.96) };
+var room2Mat   = { w: stdMat(0x111522,.96), f: stdMat(0x080b10,.98), c: stdMat(0x0e1018,.95), s: stdMat(0x18202e,.92) };
+var room3Mat   = { w: stdMat(0x060a52,.97), f: stdMat(0x04063a,.99), c: stdMat(0x080c60,.96) };
+var passageMat = { w: stdMat(0x141210,.96), f: stdMat(0x0c0a08,.98), c: stdMat(0x181614,.94) };
+
+var coveMat1    = new THREE.MeshBasicMaterial({ color: 0xff6010 });
+var coveMat2    = new THREE.MeshBasicMaterial({ color: 0x6a2848 });
+var coveMat3    = new THREE.MeshBasicMaterial({ color: 0x00ccbb });
+
+// Animated shader materials (module-scoped, updated each frame)
+var frostMat = null;
+var extMat   = null;
+var skyMat   = null;
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+// Create a box mesh and add it to the scene
+function box(w, h, d, material, x, y, z, shadow) {
+  if (shadow === undefined) shadow = true;
+  var mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
+  mesh.position.set(x, y, z);
+  if (shadow) { mesh.castShadow = true; mesh.receiveShadow = true; }
+  scene.add(mesh);
+  return mesh;
+}
+
+function pointLight(c, i, dist, dec, x, y, z) {
+  var l = new THREE.PointLight(c, i, dist, dec);
+  l.position.set(x, y, z); scene.add(l); return l;
+}
+
+// Build a wall with a rectangular door opening using four box segments
+function doorWall(totalW, totalH, floorY, wallMat, openW, doorFloor, doorH, z, depth) {
+  if (depth === undefined) depth = 0.2;
+  var pieW   = (totalW - openW) * 0.5;
+  var aboveH = totalH - (doorFloor - floorY) - doorH;
+  var belowH = doorFloor - floorY;
+  if (aboveH > 0) box(totalW, aboveH, depth, wallMat, 0, doorFloor + doorH + aboveH * 0.5, z);
+  if (belowH > 0) box(totalW, belowH, depth, wallMat, 0, floorY + belowH * 0.5, z);
+  if (pieW > 0) {
+    var pierY = doorFloor + doorH * 0.5;
+    box(pieW, doorH, depth, wallMat, -(openW * 0.5 + pieW * 0.5), pierY, z);
+    box(pieW, doorH, depth, wallMat,  (openW * 0.5 + pieW * 0.5), pierY, z);
+  }
+}
+
+// ─── ROOM 1 (dark/rose, elevated) ────────────────────────────────────────────
+var r1Floor = null, r1BenchBack = null, r1BenchLeft = null, r1BenchRight = null;
+(function() {
+  var fl = R1_FL, cl = R1_CL, x = R1X;
+  var h = cl - fl, cy = (fl + cl) * 0.5;
+  var d  = (R1_Z1 - R1_Z0) + 0.3;
+  var cz = (R1_Z0 + R1_Z1) * 0.5;
+
+  // Floor, ceiling, left wall, back wall, front wall with door
+  r1Floor = box(x*2, 0.2, d, room1Mat.f, 0, fl-0.1, cz);
+  box(x*2, 0.2, d, room1Mat.c, 0, cl+0.1, cz);
+  box(0.2, h, d, room1Mat.w, -(x+0.1), cy, cz);
+  box(x*2, h, 0.2, room1Mat.w, 0, cy, R1_Z0-0.1);
+  doorWall(x*2, h, fl, room1Mat.w, PX*2, fl, PH, R1_Z1+0.1);
+
+  // Right wall with window opening
+  var wz0 = R1_Z0 + 6, wz1 = R1_Z1 - 4;
+  var wy0 = fl + h/3,  wy1 = cl - 0.2;
+  var ww  = wz1 - wz0, wh = wy1 - wy0;
+  var wx  = x + 0.1;
+
+  box(0.2, wy0-fl, wz1-wz0, room1Mat.w, wx, fl+(wy0-fl)*0.5,   (wz0+wz1)*0.5);    // below window
+  box(0.2, cl-wy1, wz1-wz0, room1Mat.w, wx, wy1+(cl-wy1)*0.5,  (wz0+wz1)*0.5);    // above window
+  box(0.2, h, wz0-R1_Z0+0.3, room1Mat.w, wx, cy, (R1_Z0+wz0)*0.5);                 // left pier
+  box(0.2, h, R1_Z1-wz1+0.3, room1Mat.w, wx, cy, (wz1+R1_Z1)*0.5);                 // right pier
+
+  frostMat = new THREE.ShaderMaterial({
+    transparent: true, side: THREE.DoubleSide, depthWrite: false,
+    uniforms: { uTime: { value: 0.0 } },
+    vertexShader: 'varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }',
+    fragmentShader: [
+      'uniform float uTime; varying vec2 vUv;',
+      'float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }',
+      'float noise(vec2 p){ vec2 i=floor(p),f=fract(p),u=f*f*(3.0-2.0*f); return mix(mix(hash(i),hash(i+vec2(1,0)),u.x),mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),u.x),u.y); }',
+      'float fbm(vec2 p){ float v=0.0,a=0.5; for(int i=0;i<4;i++){v+=a*noise(p);p=p*2.1+vec2(1.7,9.2);a*=0.5;} return v; }',
+      'void main(){',
+      '  vec2 uv=vUv+vec2(uTime*0.004,0.0);',
+      '  float n=fbm(uv*6.0), n2=fbm(uv*3.5+vec2(4.2,1.8)+uTime*0.003);',
+      '  float bright=fbm((vUv+vec2(n*0.08,n2*0.06))*2.5);',
+      '  vec3 col=mix(vec3(0.52,0.38,0.28),vec3(0.78,0.72,0.92),smoothstep(0.1,0.85,vUv.y));',
+      '  col+=vec3(bright*0.18); col=mix(col,vec3(0.92,0.82,0.72),n*0.25);',
+      '  gl_FragColor=vec4(col,0.82+n2*0.12);',
+      '}'
+    ].join('\n')
+  });
+  var frostMesh = new THREE.Mesh(new THREE.PlaneGeometry(ww, wh), frostMat);
+  frostMesh.rotation.y = Math.PI * 0.5;
+  frostMesh.position.set(x, wy0 + wh * 0.5, (wz0 + wz1) * 0.5);
+  scene.add(frostMesh);
+
+  extMat = new THREE.ShaderMaterial({
+    side: THREE.DoubleSide,
+    uniforms: { uTime: { value: 0.0 } },
+    vertexShader: 'varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }',
+    fragmentShader: [
+      'uniform float uTime; varying vec2 vUv;',
+      'float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }',
+      'float noise(vec2 p){ vec2 i=floor(p),f=fract(p),u=f*f*(3.0-2.0*f); return mix(mix(hash(i),hash(i+vec2(1,0)),u.x),mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),u.x),u.y); }',
+      'float fbm(vec2 p){ float v=0.0,a=0.5; for(int i=0;i<5;i++){v+=a*noise(p);p=p*2.1+vec2(3.1,1.7);a*=0.5;} return v; }',
+      'void main(){',
+      '  float y=vUv.y;',
+      '  vec3 sky=mix(vec3(0.88,0.60,0.40),vec3(0.38,0.32,0.60),smoothstep(0.3,1.0,y));',
+      '  float hx=vUv.x+uTime*0.006;',
+      '  float hill1=fbm(vec2(hx*1.4,0.0))*0.32+0.06;',
+      '  float hill2=fbm(vec2(hx*0.8+5.3,0.2))*0.22+0.12;',
+      '  vec3 col=sky;',
+      '  col=mix(col,vec3(0.32,0.24,0.32),smoothstep(hill2+0.01,hill2-0.01,y));',
+      '  col=mix(col,vec3(0.22,0.18,0.28),smoothstep(hill1+0.01,hill1-0.01,y));',
+      '  col+=vec3(0.9,0.55,0.25)*exp(-abs(y-hill1-0.02)*18.0)*0.5;',
+      '  gl_FragColor=vec4(col,1.0);',
+      '}'
+    ].join('\n')
+  });
+  var extMesh = new THREE.Mesh(new THREE.PlaneGeometry(ww+2, wh+2), extMat);
+  extMesh.rotation.y = Math.PI * 0.5;
+  extMesh.position.set(wx + 0.15, wy0 + wh * 0.5, (wz0 + wz1) * 0.5);
+  scene.add(extMesh);
+
+  // Window light spill
+  pointLight(0xffeedd, 1.4, 20, 2, x - 1.5, wy0 + wh * 0.5, (wz0 + wz1) * 0.5);
+
+  // Benches
+  var benchMat = stdMat(0x0e0a0e, .95);
+  var bh = 2.25, bd = 5.5, bx = x;
+  r1BenchBack  = box(bx*2-2, bh, bd, benchMat, 0, fl+bh*0.5, R1_Z0+bd*0.5+0.1);
+  r1BenchLeft  = box(bd, bh, (R1_Z1-R1_Z0)*0.55, benchMat, -(bx-bd*0.5-0.1), fl+bh*0.5, R1_Z0+(R1_Z1-R1_Z0)*0.28);
+  r1BenchRight = box(bd, bh, (wz0-R1_Z0-1), benchMat, (bx-bd*0.5-0.1), fl+bh*0.5, R1_Z0+(wz0-R1_Z0-1)*0.5);
+
+  // Ceiling cove lighting strips
+  var cw = 0.06;
+  box(cw, cw, d, coveMat1, -(x-0.1), cl-0.1, cz, false);
+  box(cw, cw, d, coveMat1,  (x-0.1), cl-0.1, cz, false);
+  box(x*2, cw, cw, coveMat1, 0, cl-0.1, R1_Z0+0.1, false);
+  box(x*2, cw, cw, coveMat1, 0, cl-0.1, R1_Z1-0.1, false);
+}());
+
+// ─── PASSAGE 1 → 2 ───────────────────────────────────────────────────────────
+(function() {
+  var fl = R1_FL, h = PH, cy = fl + h * 0.5;
+  var dFull = P1_Z1 - P1_Z0, cz = (P1_Z0 + P1_Z1) * 0.5;
+  box(0.2, h, dFull+0.6, passageMat.w, -(PX+0.1), cy, cz);
+  box(0.2, h, dFull+0.6, passageMat.w,  (PX+0.1), cy, cz);
+  box(PX*2, 0.2, dFull, passageMat.f, 0, fl-0.1, cz);
+  box(PX*2, 0.2, dFull, passageMat.c, 0, fl+h+0.1, cz);
+}());
+
+// ─── ROOM 2 (indigo, staircase) ──────────────────────────────────────────────
+var r2EntryFloor = null, r2ExitFloor = null, r2WallL = null, r2WallR = null;
+var r2Stairs = [], r2WaterPlane = null;
+(function() {
+  var wallH  = R2_CL - R3_FL;
+  var wallCY = (R3_FL + R2_CL) * 0.5;
+  var x = R2X;
+  var d  = (R2_Z1 - R2_Z0) + 0.6;
+  var cz = (R2_Z0 + R2_Z1) * 0.5;
+
+  // Side walls
+  r2WallL = box(0.2, wallH, d, room2Mat.w, -(x+0.1), wallCY, cz);
+  r2WallR = box(0.2, wallH, d, room2Mat.w,  (x+0.1), wallCY, cz);
+
+  // Entry door (at Room 1 floor level) and exit door (at Room 3 floor level)
+  doorWall(x*2, wallH, R3_FL, room2Mat.w, PX*2, R1_FL, PH, R2_Z0-0.1);
+  doorWall(x*2, wallH, R3_FL, room2Mat.w, PX*2, R3_FL, PH, R2_Z1+0.1);
+
+  // Entry floor (at Room 1 level) and exit floor (at Room 3 level)
+  var entryEnd = ST_Z0 + 0.04;
+  r2EntryFloor = box(x*2, 0.2, entryEnd-R2_Z0, room2Mat.f, 0, R1_FL-0.1, (R2_Z0+entryEnd)*0.5);
+  var exitStart = ST_Z1 - 0.04;
+  r2ExitFloor  = box(x*2, 0.2, R2_Z1-exitStart, room2Mat.f, 0, R3_FL-0.1, (exitStart+R2_Z1)*0.5);
+
+  // Staircase — solid blocks from Room 3 floor up to each tread
+  for (var i = 0; i < ST_N; i++) {
+    var treadY = R1_FL - (i+1) * ST_RISE;
+    var blkH   = treadY - R3_FL;
+    var cY     = R3_FL + blkH * 0.5;
+    var cZ     = ST_Z0 + i * ST_RUN + ST_RUN * 0.5;
+    r2Stairs.push(box(x*2, blkH, ST_RUN+0.04, room2Mat.s, 0, cY, cZ));
+  }
+  // Top riser slab — also a caustic receiver
+  r2Stairs.push(box(x*2, ST_RISE, 0.2, room2Mat.s, 0, R1_FL-ST_RISE*0.5, ST_Z0-0.18));
+
+  // Ceiling with skylight opening
+  box(4, 0.2, d, room2Mat.c, -(x-2), R2_CL+0.1, cz);
+  box(4, 0.2, d, room2Mat.c,  (x-2), R2_CL+0.1, cz);
+  box(x*2, 0.2, 4, room2Mat.c, 0, R2_CL+0.1, R2_Z0+2);
+  box(x*2, 0.2, 4, room2Mat.c, 0, R2_CL+0.1, R2_Z1-2);
+
+  // Ceiling cove lighting strips
+  var cw = 0.06;
+  box(cw, cw, d, coveMat2, -(x-0.1), R2_CL-0.1, cz, false);
+  box(cw, cw, d, coveMat2,  (x-0.1), R2_CL-0.1, cz, false);
+  box(x*2, cw, cw, coveMat2, 0, R2_CL-0.1, R2_Z0+0.1, false);
+  box(x*2, cw, cw, coveMat2, 0, R2_CL-0.1, R2_Z1-0.1, false);
+
+  // Invisible water-ceiling caster plane — sits just below skylight,
+  // registered as a caster so waves project caustics downward onto surfaces
+  var roomW = x * 2 - 8;
+  var roomD = (R2_Z1 - R2_Z0) - 8;
+  r2WaterPlane = new THREE.Mesh(
+    new THREE.PlaneGeometry(roomW, roomD, 80, 80),
+    new THREE.MeshBasicMaterial({ visible: false })
+  );
+  r2WaterPlane.rotation.x = -Math.PI / 2;
+  r2WaterPlane.position.set(0, R2_CL - 0.5, cz);
+  scene.add(r2WaterPlane);
+}());
+
+// ─── PASSAGE 2 → 3 ───────────────────────────────────────────────────────────
+(function() {
+  var fl = R3_FL, h = PH, cy = fl + h * 0.5;
+  var dFull = P2_Z1 - P2_Z0, cz = (P2_Z0 + P2_Z1) * 0.5;
+  box(0.2, h, dFull+0.6, passageMat.w, -(PX+0.1), cy, cz);
+  box(0.2, h, dFull+0.6, passageMat.w,  (PX+0.1), cy, cz);
+  box(PX*2, 0.2, dFull, passageMat.f, 0, fl-0.1, cz);
+  box(PX*2, 0.2, dFull, passageMat.c, 0, fl+h+0.1, cz);
+}());
+
+// ─── ROOM 3 (cobalt, lower) ──────────────────────────────────────────────────
+var lensMesh  = null;
+var lensMesh2 = null;
+var lensMesh3 = null;
+var lensMesh4 = null;
+var r3Floor   = null;
+(function() {
+  var fl = R3_FL, cl = R3_CL, x = R3X;
+  var h = cl - fl, cy = (fl + cl) * 0.5;
+  var d  = (R3_Z1 - R3_Z0) + 0.3;
+  var cz = (R3_Z0 + R3_Z1) * 0.5;
+
+  // Floor, ceiling, walls, back wall with door
+  r3Floor = box(x*2, 0.2, d, room3Mat.w, 0, fl-0.1, cz);
+  box(x*2, 0.2, d, room3Mat.c, 0, cl+0.1, cz);
+  box(0.2, h, d, room3Mat.w, -(x+0.1), cy, cz);
+  box(0.2, h, d, room3Mat.w,  (x+0.1), cy, cz);
+  box(x*2, h, 0.2, room3Mat.w, 0, cy, R3_Z1+0.1);
+  doorWall(x*2, h, fl, room3Mat.w, PX*2, fl, PH, R3_Z0-0.1);
+
+  // Floating glass lens casters — four lenses in a staggered grid
+  var lensMat = new THREE.MeshPhysicalMaterial({
+    color: 0xffffff, roughness: 0.0, metalness: 0.0,
+    transparent: true, opacity: 0.18, side: THREE.DoubleSide,
+  });
+
+  var lensY = fl + 9.0;
+  lensMesh  = new THREE.Mesh(lensGeometry(), lensMat);
+  lensMesh.position.set(-3, lensY, R3_Z0 + 14);
+  lensMesh.scale.setScalar(2.2); scene.add(lensMesh);
+
+  lensMesh2 = new THREE.Mesh(lensGeometry(), lensMat);
+  lensMesh2.position.set( 3, lensY, R3_Z0 + 22);
+  lensMesh2.scale.setScalar(2.2); scene.add(lensMesh2);
+
+  lensMesh3 = new THREE.Mesh(lensGeometry(), lensMat);
+  lensMesh3.position.set(-3, lensY, R3_Z0 + 30);
+  lensMesh3.scale.setScalar(2.2); scene.add(lensMesh3);
+
+  lensMesh4 = new THREE.Mesh(lensGeometry(), lensMat);
+  lensMesh4.position.set( 3, lensY, R3_Z0 + 38);
+  lensMesh4.scale.setScalar(2.2); scene.add(lensMesh4);
+
+  // Ceiling cove lighting strips
+  var cw = 0.06;
+  box(cw, cw, d, coveMat3, -(x-0.1), cl-0.1, cz, false);
+  box(cw, cw, d, coveMat3,  (x-0.1), cl-0.1, cz, false);
+  box(x*2, cw, cw, coveMat3, 0, cl-0.1, R3_Z0+0.1, false);
+  box(x*2, cw, cw, coveMat3, 0, cl-0.1, R3_Z1-0.1, false);
+}());
+
+// ─── SKY DOME ────────────────────────────────────────────────────────────────
+(function() {
+  var skyGeo = new THREE.SphereGeometry(180, 48, 24, 0, Math.PI*2, 0, Math.PI*0.5);
+  skyMat = new THREE.ShaderMaterial({
+    side: THREE.BackSide, depthWrite: false,
+    uniforms: {
+      uTop:    { value: new THREE.Color(0x1a3a6e) },
+      uMid:    { value: new THREE.Color(0x6aaee8) },
+      uHorizon:{ value: new THREE.Color(0xd8eaf8) },
+      uCloud1: { value: new THREE.Color(0xf4b8cc) },
+      uCloud2: { value: new THREE.Color(0xf8d0e0) },
+      uTime:   { value: 0.0 }
+    },
+    vertexShader: 'varying vec3 vPos; void main(){ vPos=position; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }',
+    fragmentShader: [
+      'uniform vec3 uTop,uMid,uHorizon,uCloud1,uCloud2; uniform float uTime; varying vec3 vPos;',
+      'float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }',
+      'float noise(vec2 p){ vec2 i=floor(p),f=fract(p),u=f*f*(3.0-2.0*f); return mix(mix(hash(i),hash(i+vec2(1,0)),u.x),mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),u.x),u.y); }',
+      'float fbm(vec2 p){ float v=0.0,a=0.55; for(int i=0;i<6;i++){ v+=a*noise(p); p=p*2.03+vec2(1.7,9.2); a*=0.48; } return v; }',
+      'void main(){',
+      '  float t=clamp(vPos.y/180.0,0.0,1.0);',
+      '  vec3 sky=mix(uHorizon,uMid,smoothstep(0.0,0.45,t)); sky=mix(sky,uTop,smoothstep(0.3,1.0,t));',
+      '  vec3 dir=normalize(vPos); float denom=max(dir.y,0.05);',
+      '  vec2 uv=dir.xz/denom; uv=uv*0.18+vec2(uTime*0.018+3.7,1.2);',
+      '  float dens=fbm(uv), cloud=smoothstep(0.38,0.72,dens);',
+      '  cloud*=smoothstep(0.08,0.28,t)*(1.0-smoothstep(0.65,0.95,t));',
+      '  vec3 cloudCol=mix(uCloud1,uCloud2,noise(uv*2.0+3.3));',
+      '  gl_FragColor=vec4(mix(sky,cloudCol,cloud*0.92),1.0);',
+      '}'
+    ].join('\n')
+  });
+  var dome = new THREE.Mesh(skyGeo, skyMat);
+  dome.position.set(0, R2_CL + 0.5, (R2_Z0+R2_Z1)*0.5);
+  scene.add(dome);
+}());
+
+// ─── ROOM 2 — WATER CEILING CAUSTICS ─────────────────────────────────────────
+var r2Projector = null;
+// Light high above the plane, shining straight down
+var r2LightPos = new THREE.Vector3(0, R2_CL + 20, (R2_Z0 + R2_Z1) * 0.5);
+var r2LightDir = new THREE.Vector3(0, -1, 0);
+
+(function() {
+  r2Projector = new CausticProjector(renderer, {
+    eta:          0.85,       // gentle refraction — water-like
+    passes:       12,
+    dispersion:   0.04,
+    hueStart:     0.72,       // blue-cyan shifted — cool water light
+    hueRange:     0.4,       // narrow range: stays in blue/cyan/white
+    intensity:    0.01,
+    spread:       38.0,       // covers full 24×60m floor
+    trails:       0.0,
+    blur:         0.5,
+    gamma:        0.3,
+    warp:         0.01,
+    waveAmp:      0.2,       // visible undulation
+    waveFreq:     1.4,        // long rolling waves
+    waveSpeed:    0.5,
+    causticSize:  2048,
+  });
+
+  r2Projector.addCaster(r2WaterPlane);
+
+  // Receivers: both floor sections, all stair treads, both side walls
+  r2Projector.addReceiver(r2EntryFloor, { baseColor: [0.05, 0.06, 0.10] });
+  r2Projector.addReceiver(r2ExitFloor,  { baseColor: [0.03, 0.04, 0.08] });
+  r2Stairs.forEach(function(s) {
+    r2Projector.addReceiver(s, { baseColor: [0.06, 0.07, 0.13] });
+  });
+  r2Projector.addReceiver(r2WallL, { baseColor: [0.07, 0.08, 0.14] });
+  r2Projector.addReceiver(r2WallR, { baseColor: [0.07, 0.08, 0.14] });
+}());
+
+// ─── ROOM 1 — GLASS CASTER + CAUSTICS ────────────────────────────────────────
+var glassMesh   = null;
+var r1Projector = null;
+// Light positioned above Room 1 center — z midpoint of R1
+var r1LightPos = new THREE.Vector3(0, R1_CL - 1, (R1_Z0 + R1_Z1) * 0.5);
+var r1LightDir = new THREE.Vector3(0, -1, 0);
+
+(function() {
+  glassMesh = new THREE.Mesh(
+    dentedCubeGeometry(),
+    new THREE.MeshPhysicalMaterial({
+      color: 0xffffff, roughness: 0.0, metalness: 0.05,
+      transparent: true, opacity: 0.22, side: THREE.DoubleSide,
+    })
+  );
+  glassMesh.position.set(0, R1_FL + 11, (R1_Z0 + R1_Z1) * 0.5);
+  glassMesh.scale.setScalar(1.8);
+  scene.add(glassMesh);
+
+  r1Projector = new CausticProjector(renderer, {
+    eta:         0.75,
+    passes:      5,
+    dispersion:  0.05,
+    hueStart:    0.0,
+    hueRange:    1.0,
+    intensity:   0.07,
+    spread:      18.0,
+    trails:      0.0,
+    blur:        0.0,
+    gamma:       0.45,
+    causticSize: 4096,
+    warp:        0.08,
+  });
+
+  r1Projector.addCaster(glassMesh);
+  r1Projector.addReceiver(r1Floor,      { baseColor: [0.05, 0.04, 0.09] });
+  r1Projector.addReceiver(r1BenchBack,  { baseColor: [0.04, 0.03, 0.05] });
+  r1Projector.addReceiver(r1BenchLeft,  { baseColor: [0.04, 0.03, 0.05] });
+  r1Projector.addReceiver(r1BenchRight, { baseColor: [0.04, 0.03, 0.05] });
+}());
+
+// ─── ROOM 3 — LENS CASTER + CAUSTICS ─────────────────────────────────────────
+var r3Projector = null;
+// Light above lens position in Room 3
+var r3LightPos = new THREE.Vector3(0, R3_CL + 8, R3_Z0 + 26);
+var r3LightDir = new THREE.Vector3(0, -1, 0);
+
+(function() {
+  r3Projector = new CausticProjector(renderer, {
+    eta:              0.75,
+    passes:           10,
+    dispersion:       0.12,
+    dispersionMode:   1,       // radial (eta)
+    tangentStrength:  0.32,
+    hueStart:         0.0,
+    hueRange:         1.0,     // full spectrum
+    intensity:        0.12,
+    spread:           35.0,
+    trails:           0.30,
+    blur:             0.0,
+    gamma:            1.45,
+    warp:             0.06,
+    warpSpeed:        0.0,
+    causticSize:      2048,
+  });
+
+  r3Projector.addCaster(lensMesh);
+  r3Projector.addCaster(lensMesh2);
+  r3Projector.addCaster(lensMesh3);
+  r3Projector.addCaster(lensMesh4);
+  r3Projector.addReceiver(r3Floor, { baseColor: [0.024, 0.040, 0.320] });
+}());
+
+// ─── LIGHTING ────────────────────────────────────────────────────────────────
+scene.add(new THREE.AmbientLight(0x06040e, 1.8));
+
+// Room 1 — warm overhead lights
+pointLight(0xffffff, 1.2, 55, 2.0,  0, 15, (R1_Z0+R1_Z1)*0.5);
+pointLight(0xff8828, 1.0, 40, 2.2, -18, 14, R1_Z0+8);
+pointLight(0xff8828, 1.0, 40, 2.2,  18, 14, R1_Z1-8);
+pointLight(0xcc5510, 0.7, 30, 2.5,   0, 14, R1_Z0+20);
+pointLight(0xcc5510, 0.7, 30, 2.5,   0, 14, R1_Z1-20);
+
+// Room 2 — skylight spots
+var skySpot1 = new THREE.SpotLight(0xbad4ff, 12, 80, Math.PI/3.8, 0.55, 0.9);
+skySpot1.position.set(0, 30, (R2_Z0+R2_Z1)*0.5);
+skySpot1.target.position.set(0, 0, (R2_Z0+R2_Z1)*0.5);
+skySpot1.castShadow = true; skySpot1.shadow.mapSize.setScalar(2048);
+skySpot1.shadow.camera.near = 2; skySpot1.shadow.camera.far = 42;
+scene.add(skySpot1); scene.add(skySpot1.target);
+
+var skySpot2 = new THREE.SpotLight(0x7aabf8, 3.5, 60, Math.PI/2.8, 0.85, 1.4);
+skySpot2.position.set(0, 22, (R2_Z0+R2_Z1)*0.5);
+skySpot2.target.position.set(0, -6, (R2_Z0+R2_Z1)*0.5);
+scene.add(skySpot2); scene.add(skySpot2.target);
+
+// Room 2 — warm accent lights around skylight edges
+pointLight(0xff6810, 2.2, 32, 2, -R2X+1, R2_CL-1, R2_Z0+12);
+pointLight(0xff6810, 2.2, 32, 2,  R2X-1, R2_CL-1, R2_Z0+12);
+pointLight(0xff6810, 2.2, 32, 2, -R2X+1, R2_CL-1, R2_Z1-12);
+pointLight(0xff6810, 2.2, 32, 2,  R2X-1, R2_CL-1, R2_Z1-12);
+pointLight(0xff6810, 2.2, 32, 2,  0,     R2_CL-1, (R2_Z0+R2_Z1)*0.5);
+
+// Room 3 — turquoise
+var room3MainLight = new THREE.PointLight(0x00ddc0, 2.4, 44, 1.6);
+room3MainLight.position.set(0, R3_CL-1, (R3_Z0+R3_Z1)*0.5);
+room3MainLight.castShadow = true; room3MainLight.shadow.mapSize.setScalar(512);
+scene.add(room3MainLight);
+pointLight(0x00ccaa, 1.8, 28, 1.8,  0, R3_CL-2, R3_Z0+36);
+pointLight(0x00bbaa, 1.2, 22, 2.0, -6, R3_CL-3, R3_Z0+14);
+pointLight(0x00bbaa, 1.2, 22, 2.0,  6, R3_CL-3, R3_Z1-14);
+
+// ─── CAMERA PATH ─────────────────────────────────────────────────────────────
+var eyeR1 = R1_FL + EYE, eyeR3 = R3_FL + EYE;
+var fwdPts = [
+  new THREE.Vector3(0, eyeR1, R1_Z0+2),
+  new THREE.Vector3(0, eyeR1, (R1_Z0+R1_Z1)*0.5),
+  new THREE.Vector3(0, eyeR1, R1_Z1-4),
+  new THREE.Vector3(0, eyeR1, (P1_Z0+P1_Z1)*0.5),
+  new THREE.Vector3(0, eyeR1, R2_Z0+8),
+  new THREE.Vector3(0, eyeR1, ST_Z0-1)
+];
+for (var i = 0; i < ST_N; i++) {
+  fwdPts.push(new THREE.Vector3(0, eyeR1-(i+0.5)*ST_RISE, ST_Z0+i*ST_RUN+ST_RUN*0.5));
+}
+fwdPts.push(new THREE.Vector3(0, eyeR3, ST_Z1+2));
+fwdPts.push(new THREE.Vector3(0, eyeR3, R2_Z1-8));
+fwdPts.push(new THREE.Vector3(0, eyeR3, (P2_Z0+P2_Z1)*0.5));
+fwdPts.push(new THREE.Vector3(0, eyeR3, R3_Z0+8));
+fwdPts.push(new THREE.Vector3(0, eyeR3, R3_Z0+36));
+fwdPts.push(new THREE.Vector3(0, eyeR3, R3_Z1-8));
+var curve = new THREE.CatmullRomCurve3(fwdPts.reverse(), false, 'catmullrom', 0.5);
+
+// ─── INPUT ───────────────────────────────────────────────────────────────────
+var active = false, targetT = 0, currentT = 0;
+var yawOff = 0, pitchOff = 0;
+var dragging = false, lastX = 0, lastY = 0;
+var keys = {};
+
+document.getElementById('overlay').addEventListener('click', function() {
+  active = true; document.getElementById('overlay').style.display = 'none';
+});
+document.addEventListener('keydown', function(e) {
+  keys[e.code] = true;
+  if (e.code === 'Escape' && active) {
+    active = false; document.getElementById('overlay').style.display = 'flex';
+  }
+});
+document.addEventListener('keyup', function(e) { keys[e.code] = false; });
+
+window.addEventListener('wheel', function(e) {
+  if (!active) return;
+  camera.fov = Math.max(30, Math.min(78, camera.fov + e.deltaY * 0.03));
+  camera.updateProjectionMatrix();
+  e.preventDefault();
+}, { passive: false });
+
+renderer.domElement.addEventListener('mousedown', function(e) {
+  if (!active) return;
+  dragging = true; lastX = e.clientX; lastY = e.clientY;
+  renderer.domElement.classList.add('dragging');
+});
+window.addEventListener('mouseup', function() { dragging = false; renderer.domElement.classList.remove('dragging'); });
+window.addEventListener('mousemove', function(e) {
+  if (!dragging) return;
+  yawOff   -= (e.clientX - lastX) * 0.0028;
+  pitchOff -= (e.clientY - lastY) * 0.0028;
+  pitchOff = Math.max(-1.1, Math.min(1.1, pitchOff));
+  lastX = e.clientX; lastY = e.clientY;
+});
+renderer.domElement.addEventListener('touchstart', function(e) {
+  if (!active) return;
+  dragging = true; lastX = e.touches[0].clientX; lastY = e.touches[0].clientY;
+}, { passive: true });
+window.addEventListener('touchend', function() { dragging = false; });
+window.addEventListener('touchmove', function(e) {
+  if (!dragging) return;
+  yawOff   -= (e.touches[0].clientX - lastX) * 0.0028;
+  pitchOff -= (e.touches[0].clientY - lastY) * 0.0028;
+  pitchOff = Math.max(-1.1, Math.min(1.1, pitchOff));
+  lastX = e.touches[0].clientX; lastY = e.touches[0].clientY;
+}, { passive: true });
+
+// ─── ROOM LABEL ──────────────────────────────────────────────────────────────
+var lastLabel = '';
+var progressBar = document.getElementById('bar');
+var labelEl = document.getElementById('lbl');
+
+// Map camera z position to the room name shown in the HUD
+function roomName(t) {
+  var z = curve.getPointAt(Math.max(0, Math.min(1, t))).z;
+  if (z > P2_Z1) return 'Room I';
+  if (z > P2_Z0) return '';
+  if (z > P1_Z1) return 'Room II';
+  if (z > P1_Z0) return '';
+  return 'Room III';
+}
+
+// ─── ANIMATION LOOP ──────────────────────────────────────────────────────────
+var WALK_SPEED = 0.0006;
+var prevTime = performance.now();
+
+function animate() {
+  requestAnimationFrame(animate);
+  var now = performance.now(), dt = Math.min(now - prevTime, 80); prevTime = now;
+  var t = now * 0.001;
+
+  // Camera movement along the spline path
+  if (active) {
+    if (keys['KeyW'] || keys['ArrowUp'])   targetT = Math.min(1, targetT + WALK_SPEED * dt);
+    if (keys['KeyS'] || keys['ArrowDown']) targetT = Math.max(0, targetT - WALK_SPEED * dt);
+    currentT += (targetT - currentT) * 0.07;
+    currentT = Math.max(0, Math.min(1, currentT));
+
+    var pos = curve.getPointAt(currentT);
+    var tangent = curve.getTangentAt(currentT);
+    camera.position.copy(pos);
+    camera.rotation.order = 'YXZ';
+    camera.rotation.y = Math.atan2(-tangent.x, -tangent.z) + yawOff;
+    camera.rotation.x = pitchOff;
+
+    progressBar.style.width = (currentT * 100).toFixed(1) + '%';
+    var name = roomName(currentT);
+    if (name !== lastLabel) { labelEl.textContent = name; lastLabel = name; }
+  }
+
+  // Slowly spin the lens and glass casters
+  if (lensMesh)  { lensMesh.rotation.y  += 0.008;  lensMesh.rotation.x  += 0.006; }
+  if (lensMesh2) { lensMesh2.rotation.y -= 0.007;  lensMesh2.rotation.x += 0.005; }
+  if (lensMesh3) { lensMesh3.rotation.y += 0.006;  lensMesh3.rotation.x -= 0.007; }
+  if (lensMesh4) { lensMesh4.rotation.y -= 0.009;  lensMesh4.rotation.x += 0.004; }
+  if (glassMesh) { glassMesh.rotation.y += 0.008; }
+
+  // Drive animated shader uniforms
+  if (skyMat)   skyMat.uniforms.uTime.value   = t;
+  if (frostMat) frostMat.uniforms.uTime.value = t;
+  if (extMat)   extMat.uniforms.uTime.value   = t;
+
+  // Update caustic projectors (each renders to internal targets, then resets to null)
+  if (r2Projector) { r2Projector.update(r2LightPos, r2LightDir, t); renderer.setRenderTarget(null); }
+  if (r1Projector) { r1Projector.update(r1LightPos, r1LightDir, t); renderer.setRenderTarget(null); }
+  if (r3Projector) { r3Projector.update(r3LightPos, r3LightDir, t); renderer.setRenderTarget(null); }
+
+  // Final scene render (manual clear because autoClear = false)
+  renderer.clear();
+  renderer.render(scene, camera);
+}
+animate();
+
+window.addEventListener('resize', function() {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
